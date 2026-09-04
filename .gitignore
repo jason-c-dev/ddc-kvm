@@ -1,0 +1,7 @@
+# bats / editor / OS noise
+.bats-tmp/
+*.swp
+.DS_Store
+
+# local Claude Code state
+.claude/settings.local.json

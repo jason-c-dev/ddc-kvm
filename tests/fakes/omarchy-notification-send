@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+printf '%s\n' "omarchy-notification-send $*" >>"${FAKE_LOG:?FAKE_LOG not set}"

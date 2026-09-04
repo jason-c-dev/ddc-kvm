@@ -1,0 +1,35 @@
+# ddc-kvm config
+#
+# Install at ~/.config/ddc-kvm/config (or point DDC_KVM_CONFIG / --config at it).
+# One copy of this file, with `self` and `connector` adjusted, goes on every
+# machine that shares the monitor.
+#
+# Lines are `key = value`; `#` starts a comment.
+
+# Which [machines] entry is the machine this file lives on. Switching to self
+# is a no-op, and `ddc-kvm next` starts counting from here.
+self      = desktop
+
+# Linux: the DRM connector this machine's cable is on, as shown by
+# `ddcutil detect` ("DRM connector: card1-DP-1" -> DP-1) or your compositor
+# (hyprctl monitors, xrandr, wlr-randr). Used to find the right i2c bus when
+# more than one display is attached. Note the monitor's own OSD may number the
+# jack differently (Dell calls this one "DP 2").
+connector = DP-1
+
+# Skip detection and use a fixed i2c bus (from `ddcutil detect`). Optional.
+# bus     = 9
+
+# Desktop notification before switching: auto (default) or off.
+notify    = auto
+
+[machines]
+# name    = <VCP 0x60 value>   <label shown in notifications and `list`>
+#
+# The value is what the monitor reports for `ddcutil getvcp 60` while that
+# machine is the active input. Vendors use non-standard values; see the
+# ddc-kvm skill's references/dell-vcp-codes.md. Never guess: read it live.
+mini   = 0x19   Mac mini (Thunderbolt 4)
+nuc    = 0x0F   NUC (DisplayPort 1 / USB-C2)
+desktop    = 0x13   Desktop (DisplayPort 2 / USB-C3)
+macbook   = 0x11   Work MacBook (HDMI 1 / USB-C4)

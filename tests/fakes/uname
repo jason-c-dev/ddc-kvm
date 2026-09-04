@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake uname: reports $FAKE_UNAME (default Linux) so the backend selector can be tested.
+printf '%s\n' "${FAKE_UNAME:-Linux}"

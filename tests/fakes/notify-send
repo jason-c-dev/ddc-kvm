@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+printf '%s\n' "notify-send $*" >>"${FAKE_LOG:?FAKE_LOG not set}"

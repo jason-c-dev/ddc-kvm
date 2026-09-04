@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: ./scripts
+          additional_files: tests/fakes/ddcutil tests/fakes/uname tests/fakes/notify-send tests/fakes/omarchy-notification-send tests/test_helper.bash
+        env:
+          SHELLCHECK_OPTS: -x
+
+  test:
+    name: bats
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bats-core/bats-action@3.0.1
+        with:
+          support-install: true
+          assert-install: true
+          detik-install: false
+          file-install: false
+      - run: sudo apt-get update && sudo apt-get install -y jq
+      - run: make test
+        env:
+          BATS_LIB_PATH: /usr/lib/bats
+
+  validate:
+    name: claude plugin validate
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: claude plugin validate --strict .

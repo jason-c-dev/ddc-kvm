@@ -1,0 +1,9 @@
+{
+  "name": "ddc-kvm",
+  "version": "0.1.0",
+  "description": "Switch a monitor's input and its built-in USB KVM from a hotkey over DDC/CI. A config-driven CLI for the hot path plus a setup skill that probes the monitor, decodes vendor input codes, writes the config, binds keys, and sets up the return trip from the other machine.",
+  "author": { "name": "Jason Croucher", "url": "https://github.com/jason-c-dev" },
+  "repository": "https://github.com/jason-c-dev/ddc-kvm",
+  "license": "MIT",
+  "keywords": ["ddc", "ddcci", "ddcutil", "kvm", "monitor", "input-switch", "dell", "hyprland", "omarchy", "thunderbolt"]
+}

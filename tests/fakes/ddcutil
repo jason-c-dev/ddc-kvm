@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Fake ddcutil for tests. Records every invocation to $FAKE_LOG and answers
+# from fixtures/env:
+#   FAKE_DETECT      file whose contents are printed for `detect`
+#   FAKE_GETVCP      text printed for `getvcp 60` (default: "VCP 60 SNC x13")
+#   FAKE_SETVCP_RC   exit code for `setvcp` (default 0)
+#   FAKE_GETVCP_RC   exit code for `getvcp` (default 0)
+printf '%s\n' "ddcutil $*" >>"${FAKE_LOG:?FAKE_LOG not set}"
+for arg in "$@"; do
+  case $arg in
+    detect)
+      [[ -n ${FAKE_DETECT:-} ]] && cat "$FAKE_DETECT"
+      exit 0 ;;
+    getvcp)
+      printf '%s\n' "${FAKE_GETVCP-VCP 60 SNC x13}"
+      exit "${FAKE_GETVCP_RC:-0}" ;;
+    setvcp)
+      exit "${FAKE_SETVCP_RC:-0}" ;;
+  esac
+done
+exit 0

@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+#
+# ddc-kvm - switch a monitor's active input, and the USB KVM built into it,
+# over DDC/CI. Config-driven; no vendor or hotkey knowledge baked in.
+#
+#   ddc-kvm <machine>    switch the monitor to <machine>
+#   ddc-kvm next         switch to the machine listed after this one
+#   ddc-kvm status       show the current input
+#   ddc-kvm list         show the configured machines
+#
+# The switch is a single write of VCP feature 0x60 (Input Source). On monitors
+# with a built-in KVM the USB hub follows the video input, so this one write is
+# the whole KVM switch. It is one-way by nature: once the monitor switches away,
+# this machine loses its display link and with it the DDC channel, so the other
+# machine has to switch back. See the ddc-kvm skill for the full story.
+#
+# Written to run on bash 3.2 (macOS) as well as modern bash: no associative
+# arrays, no mapfile, no ${var,,}.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+PROG="ddc-kvm"
+
+CONFIG_PATH="${DDC_KVM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ddc-kvm/config}"
+DRY_RUN=0
+NO_NOTIFY=0
+BUS_OPT=""
+BACKEND=""
+
+# Loaded from the config file.
+CFG_SELF=""
+CFG_CONNECTOR=""
+CFG_BUS=""
+CFG_NOTIFY="auto"
+CFG_BACKEND=""
+NAMES=()
+VALUES=()
+LABELS=()
+
+# Exit codes
+EX_BACKEND=1   # DDC/CI or backend tool failure
+EX_USAGE=2     # bad arguments or unknown machine
+EX_CONFIG=3    # config file missing or invalid
+EX_NOTOOL=4    # backend tool not installed or platform unsupported
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] <machine> | next | status | list
+
+Switch a monitor's input (and its built-in USB KVM) over DDC/CI.
+
+Commands:
+  <machine>        switch the monitor to the named machine
+  next             switch to the machine listed after this one (wraps around)
+  status           print the monitor's current input
+  list             print the configured machines (* = this machine, > = current)
+
+Options:
+  --config PATH    config file (default: $CONFIG_PATH)
+  --bus N          use i2c bus N instead of detecting it (ddcutil backend)
+  --dry-run        print the backend command instead of running it
+  --no-notify      do not send a desktop notification
+  -V, --version    print the version
+  -h, --help       show this help
+
+Config: $CONFIG_PATH
+EOF
+}
+
+notifier=""
+find_notifier() {
+  if [[ $NO_NOTIFY -eq 1 || $CFG_NOTIFY == "off" ]]; then
+    notifier=""
+  elif command -v omarchy-notification-send >/dev/null 2>&1; then
+    notifier="omarchy-notification-send"
+  elif command -v notify-send >/dev/null 2>&1; then
+    notifier="notify-send"
+  else
+    notifier=""
+  fi
+}
+
+# notify <urgency> <headline> [body]
+notify() {
+  [[ -n $notifier ]] || return 0
+  local urgency=$1 headline=$2 body=${3:-}
+  if [[ -n $body ]]; then
+    "$notifier" -u "$urgency" "$headline" "$body" >/dev/null 2>&1 || true
+  else
+    "$notifier" -u "$urgency" "$headline" >/dev/null 2>&1 || true
+  fi
+}
+
+# die <exit-code> <message...>
+# Runtime failures (backend, config, missing tool) also raise a critical
+# notification so a hotkey that silently does nothing is still visible.
+die() {
+  local code=$1
+  shift
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  case $code in
+    "$EX_BACKEND" | "$EX_CONFIG" | "$EX_NOTOOL") notify critical "$PROG failed" "$*" ;;
+  esac
+  exit "$code"
+}
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+# Parse the INI-ish config with a single awk pass. Emits tab-separated records:
+#   K <key> <value>              scalar setting (before any section header)
+#   M <name> <hex> <label>       machine entry from [machines]
+#   E <line> <message>           parse error
+# The file is never sourced.
+parse_config() {
+  awk '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    BEGIN { section = "" }
+    {
+      line = $0
+      sub(/[ \t]*#.*$/, "", line)
+      line = trim(line)
+      if (line == "") next
+      if (line ~ /^\[.*\]$/) {
+        section = tolower(trim(substr(line, 2, length(line) - 2)))
+        if (section != "machines") printf "E\t%d\tunknown section [%s]\n", NR, section
+        next
+      }
+      eq = index(line, "=")
+      if (eq == 0) { printf "E\t%d\texpected key = value\n", NR; next }
+      key = tolower(trim(substr(line, 1, eq - 1)))
+      val = trim(substr(line, eq + 1))
+      if (key == "") { printf "E\t%d\tempty key\n", NR; next }
+      if (section == "") { printf "K\t%s\t%s\n", key, val; next }
+      if (section != "machines") next
+      if (key !~ /^[a-z0-9][a-z0-9_-]*$/) {
+        printf "E\t%d\tbad machine name \"%s\" (use letters, digits, - and _)\n", NR, key; next
+      }
+      hex = val; sub(/[ \t].*$/, "", hex)
+      label = val; sub(/^[^ \t]+[ \t]*/, "", label)
+      if (hex !~ /^0[xX][0-9a-fA-F][0-9a-fA-F]?$/) {
+        printf "E\t%d\tbad input value \"%s\" for %s (expected hex such as 0x11)\n", NR, hex, key; next
+      }
+      printf "M\t%s\t%s\t%s\n", key, tolower(hex), label
+    }
+  ' "$1"
+}
+
+load_config() {
+  [[ -f $CONFIG_PATH ]] || die "$EX_CONFIG" "no config at $CONFIG_PATH (run /ddc-kvm:setup, or copy examples/config.example)"
+
+  local kind a b c errors=""
+  while IFS=$'\t' read -r kind a b c; do
+    case $kind in
+      K)
+        case $a in
+          self) CFG_SELF=$(lower "$b") ;;
+          connector) CFG_CONNECTOR=$b ;;
+          bus) CFG_BUS=$b ;;
+          notify) CFG_NOTIFY=$(lower "$b") ;;
+          backend) CFG_BACKEND=$(lower "$b") ;;
+          *) errors="${errors}unknown setting \"$a\"; " ;;
+        esac
+        ;;
+      M)
+        NAMES[${#NAMES[@]}]=$a
+        VALUES[${#VALUES[@]}]=$(normalise_hex "$b")
+        LABELS[${#LABELS[@]}]=$c
+        ;;
+      E) errors="${errors}line $a: $b; " ;;
+    esac
+  done < <(parse_config "$CONFIG_PATH")
+
+  [[ -z $errors ]] || die "$EX_CONFIG" "invalid config $CONFIG_PATH: ${errors% }"
+  [[ ${#NAMES[@]} -gt 0 ]] || die "$EX_CONFIG" "no machines defined in $CONFIG_PATH"
+  if [[ -n $CFG_SELF ]] && ! lookup "$CFG_SELF" >/dev/null; then
+    die "$EX_CONFIG" "self = $CFG_SELF is not in [machines] in $CONFIG_PATH"
+  fi
+  if [[ -n $CFG_BUS && ! $CFG_BUS =~ ^[0-9]+$ ]]; then
+    die "$EX_CONFIG" "bus = $CFG_BUS is not a number in $CONFIG_PATH"
+  fi
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# 0xF / 0X0f / 0x0F -> 0x0f
+normalise_hex() { printf '0x%02x' "$(( $1 ))"; }
+
+hex_to_dec() { printf '%d' "$(( $1 ))"; }
+
+# lookup <name> -> prints the index, or returns 1
+lookup() {
+  local i
+  for (( i = 0; i < ${#NAMES[@]}; i++ )); do
+    if [[ ${NAMES[$i]} == "$1" ]]; then
+      printf '%s' "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# index_of_value <hex> -> prints the index, or returns 1
+index_of_value() {
+  local i
+  for (( i = 0; i < ${#VALUES[@]}; i++ )); do
+    if [[ ${VALUES[$i]} == "$1" ]]; then
+      printf '%s' "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+
+known_names() {
+  local i out=""
+  for (( i = 0; i < ${#NAMES[@]}; i++ )); do
+    out="${out}${NAMES[$i]} "
+  done
+  printf '%s' "${out% }"
+}
+
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+
+select_backend() {
+  local os
+  BACKEND=${CFG_BACKEND:-${DDC_KVM_BACKEND:-}}
+  if [[ -z $BACKEND ]]; then
+    os=$(uname -s 2>/dev/null || echo unknown)
+    case $os in
+      Linux) BACKEND=ddcutil ;;
+      Darwin)
+        die "$EX_NOTOOL" "macOS is not supported by this version yet. Use m1ddc (\"m1ddc set input <decimal>\") or the BetterDisplay CLI; see the ddc-kvm skill's one-way-problem.md"
+        ;;
+      *) die "$EX_NOTOOL" "unsupported platform: $os" ;;
+    esac
+  fi
+  case $BACKEND in
+    ddcutil)
+      command -v ddcutil >/dev/null 2>&1 || die "$EX_NOTOOL" "ddcutil is not installed (Arch: pacman -S ddcutil; Debian/Ubuntu: apt install ddcutil)"
+      ;;
+    *) die "$EX_CONFIG" "unknown backend \"$BACKEND\" (supported: ddcutil)" ;;
+  esac
+}
+
+# run <argv...> - execute, or print under --dry-run
+run() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '%s\n' "$*"
+    return 0
+  fi
+  "$@"
+}
+
+# --- ddcutil ---------------------------------------------------------------
+
+bus=""
+
+# Find the i2c bus for the configured connector. Same idea as Omarchy's
+# omarchy-brightness-display-ddc: match the "DRM connector" line of
+# `ddcutil detect --brief` against the connector name.
+ddcutil_bus() {
+  if [[ -n $BUS_OPT ]]; then bus=$BUS_OPT; return 0; fi
+  if [[ -n $CFG_BUS ]]; then bus=$CFG_BUS; return 0; fi
+
+  local detect
+  detect=$(ddcutil --skip-ddc-checks detect --brief 2>/dev/null || true)
+  bus=$(printf '%s\n' "$detect" | awk -v connector="$CFG_CONNECTOR" '
+    /I2C bus:/ { b = $NF; sub(/^.*\/i2c-/, "", b); if (connector == "" && b != "") { print b; exit } }
+    /DRM[ _]connector:/ {
+      c = $NF; sub(/^card[0-9]+-/, "", c)
+      if (c == connector && b != "") { print b; exit }
+      b = ""
+    }
+  ')
+  if [[ -z $bus ]]; then
+    if [[ -n $CFG_CONNECTOR ]]; then
+      die "$EX_BACKEND" "no DDC/CI display found on connector $CFG_CONNECTOR (is this machine the monitor's active input? is DDC/CI enabled in the OSD?)"
+    else
+      die "$EX_BACKEND" "no DDC/CI display found (is DDC/CI enabled in the monitor's OSD?)"
+    fi
+  fi
+}
+
+# Prints the current input as normalised hex (0x13), or returns 1.
+ddcutil_get() {
+  local out val
+  out=$(ddcutil --bus "$bus" getvcp 60 --brief 2>/dev/null || true)
+  # --brief: "VCP 60 SNC x13"; verbose forms: "(sl=0x13)" or "current value = 19"
+  val=$(printf '%s\n' "$out" | awk '
+    /^VCP 60 / { v = $4; sub(/^x/, "0x", v); print v; exit }
+    /sl=0x[0-9a-fA-F]+/ { match($0, /sl=0x[0-9a-fA-F]+/); print substr($0, RSTART + 3, RLENGTH - 3); exit }
+    /current value =/ { match($0, /current value = *[0-9]+/); v = substr($0, RSTART, RLENGTH); sub(/.*= */, "", v); print v; exit }
+  ')
+  [[ -n $val ]] || return 1
+  normalise_hex "$val"
+}
+
+ddcutil_set() {
+  # --noverify: the display link drops the instant the switch succeeds, so a
+  # read-back would fail and report a false error.
+  run ddcutil --bus "$bus" --noverify setvcp 60 "$1"
+}
+
+backend_prepare() { case $BACKEND in ddcutil) ddcutil_bus ;; esac; }
+backend_get() { case $BACKEND in ddcutil) ddcutil_get ;; esac; }
+backend_set() { case $BACKEND in ddcutil) ddcutil_set "$1" ;; esac; }
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+describe_value() {
+  local hex=$1 idx
+  if idx=$(index_of_value "$hex"); then
+    printf '%s (%s) %s - %s\n' "$hex" "$(hex_to_dec "$hex")" "${NAMES[$idx]}" "${LABELS[$idx]}"
+  else
+    printf '%s (%s) unknown\n' "$hex" "$(hex_to_dec "$hex")"
+  fi
+}
+
+cmd_status() {
+  select_backend
+  backend_prepare
+  local current idx
+  current=$(backend_get) || die "$EX_BACKEND" "could not read the current input over DDC/CI"
+  describe_value "$current"
+  if [[ -n $CFG_SELF ]] && idx=$(index_of_value "$current") && [[ ${NAMES[$idx]} != "$CFG_SELF" ]]; then
+    printf '%s: note: the monitor reports %s but this config says self = %s\n' "$PROG" "${NAMES[$idx]}" "$CFG_SELF" >&2
+  fi
+}
+
+cmd_list() {
+  local current="" i self_mark cur_mark
+  # Probe in a subshell so a missing backend or unreachable display only
+  # drops the ">" marker instead of aborting the listing.
+  current=$( (select_backend && backend_prepare && backend_get) 2>/dev/null || true)
+  for (( i = 0; i < ${#NAMES[@]}; i++ )); do
+    self_mark=" "; cur_mark=" "
+    [[ ${NAMES[$i]} == "$CFG_SELF" ]] && self_mark="*"
+    [[ -n $current && ${VALUES[$i]} == "$current" ]] && cur_mark=">"
+    printf '%s%s %-12s %s  %s\n' "$self_mark" "$cur_mark" "${NAMES[$i]}" "${VALUES[$i]}" "${LABELS[$i]}"
+  done
+}
+
+cmd_switch() {
+  local name=$1 idx
+  idx=$(lookup "$name") || die "$EX_USAGE" "unknown machine \"$name\" (known: $(known_names))"
+  select_backend
+  backend_prepare
+  if [[ -n $CFG_SELF && $name == "$CFG_SELF" ]]; then
+    # Switching to self: a no-op if the monitor already shows us. Otherwise
+    # go ahead; some monitors (Dell U5226KW, for one) keep DDC alive on
+    # inactive inputs, so this pulls the monitor back, e.g. over SSH from
+    # the machine that currently has it.
+    local current
+    current=$(backend_get 2>/dev/null || true)
+    if [[ $current == "${VALUES[$idx]}" ]]; then
+      printf '%s: already on %s\n' "$PROG" "$name"
+      return 0
+    fi
+  fi
+  notify low "Switching monitor to ${LABELS[$idx]:-$name}"
+  backend_set "${VALUES[$idx]}" || die "$EX_BACKEND" "switch to $name failed"
+}
+
+cmd_next() {
+  [[ -n $CFG_SELF ]] || die "$EX_CONFIG" "\"next\" needs self = <machine> in $CONFIG_PATH"
+  [[ ${#NAMES[@]} -gt 1 ]] || die "$EX_USAGE" "only one machine configured; nothing to switch to"
+  local idx
+  idx=$(lookup "$CFG_SELF")
+  idx=$(( (idx + 1) % ${#NAMES[@]} ))
+  cmd_switch "${NAMES[$idx]}"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --config) [[ $# -ge 2 ]] || die "$EX_USAGE" "--config needs a path"; CONFIG_PATH=$2; shift 2 ;;
+      --config=*) CONFIG_PATH=${1#--config=}; shift ;;
+      --bus) [[ $# -ge 2 ]] || die "$EX_USAGE" "--bus needs a number"; BUS_OPT=$2; shift 2 ;;
+      --bus=*) BUS_OPT=${1#--bus=}; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --no-notify) NO_NOTIFY=1; shift ;;
+      -V | --version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+      -h | --help) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) usage >&2; die "$EX_USAGE" "unknown option $1" ;;
+      *)
+        [[ -z $cmd ]] || { usage >&2; die "$EX_USAGE" "unexpected argument $1"; }
+        cmd=$1; shift ;;
+    esac
+  done
+  [[ $# -eq 0 ]] || { usage >&2; die "$EX_USAGE" "unexpected argument $1"; }
+  if [[ -z $cmd ]]; then
+    usage >&2
+    exit "$EX_USAGE"
+  fi
+  if [[ -n $BUS_OPT && ! $BUS_OPT =~ ^[0-9]+$ ]]; then
+    die "$EX_USAGE" "--bus expects a number, got \"$BUS_OPT\""
+  fi
+
+  load_config
+  find_notifier
+
+  case $cmd in
+    status) cmd_status ;;
+    list) cmd_list ;;
+    next) cmd_next ;;
+    *) cmd_switch "$(lower "$cmd")" ;;
+  esac
+}
+
+main "$@"

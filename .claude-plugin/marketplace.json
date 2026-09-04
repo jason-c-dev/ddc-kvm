@@ -1,0 +1,16 @@
+{
+  "name": "ddc-kvm",
+  "description": "Hotkey switching of a monitor's input and built-in USB KVM over DDC/CI, from Linux, with a guided Claude Code setup skill.",
+  "owner": {
+    "name": "Jason Croucher",
+    "url": "https://github.com/jason-c-dev"
+  },
+  "plugins": [
+    {
+      "name": "ddc-kvm",
+      "source": "./",
+      "version": "0.1.0",
+      "description": "Hotkey switching of a monitor's input and USB KVM over DDC/CI, with a guided setup skill."
+    }
+  ]
+}
